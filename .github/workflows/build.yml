@@ -1,0 +1,78 @@
+name: build-mx6-kernel
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'board/**'
+      - 'config/**'
+      - '.github/workflows/**'
+
+jobs:
+  build:
+    # 公开仓库免费的原生 arm64 4vCPU/16GB runner
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 180
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install build deps
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq bc bison flex libssl-dev libelf-dev \
+                                     device-tree-compiler rsync cpio kmod
+
+      - name: Fetch mt6797-mainline kernel
+        run: |
+          git clone --depth 1 https://github.com/mt6797-mainline/linux.git "$RUNNER_TEMP/linux"
+          cd "$RUNNER_TEMP/linux"
+          git log -1 --format='KERNEL_HEAD %H %ad %s' --date=short
+
+      - name: Apply board files
+        run: |
+          K="$RUNNER_TEMP/linux"
+          cp board/mt6797-meizu-mx6.dts "$K/arch/arm64/boot/dts/mediatek/"
+          cp board/mt6797-meizu-mx6-stockbase.dts "$K/arch/arm64/boot/dts/mediatek/" 2>/dev/null || true
+          MK="$K/arch/arm64/boot/dts/mediatek/Makefile"
+          for d in mt6797-meizu-mx6 mt6797-meizu-mx6-stockbase; do
+            if [ -f "$K/arch/arm64/boot/dts/mediatek/$d.dts" ] && ! grep -q "$d" "$MK"; then
+              echo "dtb-\$(CONFIG_ARCH_MEDIATEK) += $d.dtb" >> "$MK"
+            fi
+          done
+          cp config/min.config "$K/.config"
+          sh config/apply.sh "$K"
+          cd "$K"
+          make ARCH=arm64 olddefconfig >/dev/null
+          echo '===== effective config ====='
+          for k in CONFIG_CMDLINE CONFIG_DEBUG_INFO_BTF CONFIG_USB_MUSB_HDRC \
+                   CONFIG_USB_MUSB_GADGET CONFIG_USB_MUSB_MEDIATEK CONFIG_USB_MTU3 \
+                   CONFIG_FB_SIMPLE CONFIG_FRAMEBUFFER_CONSOLE CONFIG_PSTORE_RAM; do
+            printf '%-34s %s\n' "$k" "$(grep -E "^$k=|^# $k is not set" .config | head -1)"
+          done
+
+      - name: Build Image.gz + dtbs
+        run: |
+          K="$RUNNER_TEMP/linux"
+          cd "$K"
+          make -j"$(nproc)" ARCH=arm64 Image.gz dtbs 2>&1 | tail -40
+          echo "===== artifacts ====="
+          ls -l arch/arm64/boot/Image.gz
+
+      - name: Collect
+        run: |
+          K="$RUNNER_TEMP/linux"
+          mkdir -p out
+          cp "$K/arch/arm64/boot/Image.gz" out/
+          cp "$K/arch/arm64/boot/dts/mediatek/mt6797-meizu-mx6.dtb" out/ 2>/dev/null || true
+          cp "$K/arch/arm64/boot/dts/mediatek/mt6797-meizu-mx6-stockbase.dtb" out/ 2>/dev/null || true
+          cp "$K/.config" out/config-built.txt
+          ls -l out/
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: mx6-6x-kernel
+          path: out/
+          retention-days: 30
