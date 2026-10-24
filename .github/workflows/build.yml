@@ -6,6 +6,7 @@ on:
     paths:
       - 'board/**'
       - 'config/**'
+      - 'rootfs/**'
       - '.github/workflows/**'
 
 jobs:
@@ -18,11 +19,24 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install build deps
+      - name: Install build deps + ccache
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq bc bison flex libssl-dev libelf-dev \
-                                     device-tree-compiler rsync cpio kmod
+                                     device-tree-compiler rsync cpio kmod ccache
+          echo "CCACHE_DIR=$HOME/.ccache" >> $GITHUB_ENV
+          echo "CCACHE_MAXSIZE=2G"     >> $GITHUB_ENV
+          echo "PATH=/usr/lib/ccache:$PATH" >> $GITHUB_ENV
+          ccache --version | head -1
+
+      - name: Restore ccache
+        uses: actions/cache@v4
+        with:
+          path: ~/.ccache
+          key: ccache-${{ hashFiles('config/min.config','config/apply.sh','board/**') }}-${{ github.run_id }}
+          restore-keys: |
+            ccache-${{ hashFiles('config/min.config','config/apply.sh','board/**') }}-
+            ccache-
 
       - name: Fetch mt6797-mainline kernel
         run: |
@@ -33,6 +47,8 @@ jobs:
       - name: Apply board files
         run: |
           K="$RUNNER_TEMP/linux"
+          gunzip -c rootfs/bin/busybox.gz > rootfs/bin/busybox
+          chmod +x rootfs/init rootfs/bin/busybox
           cp board/mt6797-meizu-mx6.dts "$K/arch/arm64/boot/dts/mediatek/"
           cp board/mt6797-meizu-mx6-stockbase.dts "$K/arch/arm64/boot/dts/mediatek/" 2>/dev/null || true
           MK="$K/arch/arm64/boot/dts/mediatek/Makefile"
@@ -44,11 +60,12 @@ jobs:
           cp config/min.config "$K/.config"
           sh config/apply.sh "$K"
           cd "$K"
+          scripts/config --file .config --set-str INITRAMFS_SOURCE "$GITHUB_WORKSPACE/rootfs"
           make ARCH=arm64 olddefconfig >/dev/null
           echo '===== effective config ====='
-          for k in CONFIG_CMDLINE CONFIG_DEBUG_INFO_BTF CONFIG_USB_MUSB_HDRC \
-                   CONFIG_USB_MUSB_GADGET CONFIG_USB_MUSB_MEDIATEK CONFIG_USB_MTU3 \
-                   CONFIG_FB_SIMPLE CONFIG_FRAMEBUFFER_CONSOLE CONFIG_PSTORE_RAM; do
+          for k in CONFIG_CMDLINE CONFIG_INITRAMFS_SOURCE CONFIG_DEBUG_INFO_BTF \
+                   CONFIG_USB_MUSB_HDRC CONFIG_USB_MUSB_GADGET CONFIG_USB_MUSB_MEDIATEK \
+                   CONFIG_USB_MTU3 CONFIG_FB_SIMPLE CONFIG_FRAMEBUFFER_CONSOLE CONFIG_PSTORE_RAM; do
             printf '%-34s %s\n' "$k" "$(grep -E "^$k=|^# $k is not set" .config | head -1)"
           done
 
@@ -68,6 +85,8 @@ jobs:
           fi
           tail -5 build.log
           ls -l arch/arm64/boot/Image.gz
+          echo "=== ccache ==="
+          ccache -s | head -12
 
       - name: Build dtbs
         run: |
