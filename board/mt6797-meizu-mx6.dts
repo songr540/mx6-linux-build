@@ -1,0 +1,238 @@
+// SPDX-License-Identifier: GPL-2.0-only
+/*
+ * Meizu MX6 (MT6797 / Helio X20) -- ACM serial bring-up
+ *
+ * 设计原则（照 mt6797-mainline 的 retain-bootloader-state 思路）：
+ *   1. 不重新初始化 LK 已经配好的 clk / PHY / pinmux。
+ *      topckgen / infrasys / apmixedsys 全部不碰，时钟由两个
+ *      "retained" 驱动提供（phy-mt6797-lk-usb / clk-mt6797-infra-lk）。
+ *   2. 第一版只启用**一个**外设：USB device（mtu3 + gadget）。
+ *      没有 eMMC、没有 display、没有 PMIC regulator。
+ *      理由：变量越少，能启动的概率越高；而 USB 一通，日志就有了。
+ *   3. 所有地址来自 MX6 自己的原厂 DTB（out/stock-boot.dts），
+ *      不是从 X620 套过来的：
+ *        memory        0x40000000 + 0x40000000 (1 GiB，单段连续)
+ *        ram_console   0x44400000  64 KiB
+ *        pstore        0x44410000 896 KiB
+ *        atf           0x44600000  64 KiB + 0x44610000 192 KiB
+ *        preloader     0x44800000   1 MiB
+ *        lk            0x46000000   4 MiB
+ *        uart0         0x11002000 SPI 91
+ *        usb3(ssusb)   0x11270000 / sif 0x11280000 / sif2 0x11290000
+ *        mtu3 mac      0x11271000   ippc 0x11280700   SPI 127
+ *        pwrap         0x1000d000  SPI 178 (MT6351)
+ *
+ * ⚠️ 0x44000000 在 MX6 上是 **LK 放 ramdisk 的地址**
+ *    （原厂 bootargs: initrd=0x44000000,0x4B434E）。
+ *    所以本 dts 用 CONFIG_INITRAMFS_SOURCE 把 initramfs 编进内核本身，
+ *    完全不走 initrd= 传递，也就不会和 LK 的布局打架。
+ */
+/dts-v1/;
+
+#include "mt6797.dtsi"
+#include <dt-bindings/clock/mt6797-clk.h>
+#include <dt-bindings/gpio/gpio.h>
+#include <dt-bindings/interrupt-controller/arm-gic.h>
+
+/ {
+	model = "Meizu MX6 (MT6797 ACM serial)";
+	/*
+	 * 保留 leeco,x620 是为了满足两个 retained 驱动里
+	 * of_machine_is_compatible("leeco,x620") 的硬检查；
+	 * 它们内部的 PHY 序列 / gate mask 都是 MT6797 SoC 级常量，与板无关。
+	 */
+	compatible = "meizu,mx6", "leeco,x620", "mediatek,mt6797";
+
+	aliases {
+		serial0 = &uart0;
+	};
+
+	memory@40000000 {
+		device_type = "memory";
+		/* MX6 1 GiB 版；原厂 DTB 就是单段连续 */
+		reg = <0 0x40000000 0 0x40000000>;
+	};
+
+	chosen {
+		#address-cells = <2>;
+		#size-cells = <2>;
+		ranges;
+
+		/*
+		 * v2 关键改动：
+		 *  - 去掉 earlycon / console=ttyS0。v1 的 wdt_by_pass_pwk 说明内核在
+		 *    pstore 之前就挂死；最早的可疑动作就是 earlycon 直接 mmio 访问
+		 *    UART0（0x11002000），而那一刻 UART0 的时钟未必被 LK 打开，
+		 *    读寄存器可能让总线挂起。X620 的 dts 里 uart0 也是 disabled。
+		 *  - 改用 simplefb + tty0。fb 地址来自实机
+		 *    /proc/device-tree/chosen/atag,videolfb 的 u64（0xB9BE0000），
+		 *    不是推算值。vramSize=0x1BE0000，一帧 1088*1920*4=0x7F8000。
+		 */
+		bootargs = "console=tty0 clk_ignore_unused pd_ignore_unused maxcpus=1 cpuidle.off=1 rdinit=/init panic=10 loglevel=8 ignore_loglevel printk.time=1 fbcon=nodefer";
+
+		framebuffer0: framebuffer@b9be0000 {
+			compatible = "simple-framebuffer";
+			reg = <0 0xb9be0000 0 0x7f8000>;
+			width = <1080>;
+			height = <1920>;
+			stride = <4352>;
+			format = "x8r8g8b8";
+		};
+	};
+
+	reserved-memory {
+		#address-cells = <2>;
+		#size-cells = <2>;
+		ranges;
+
+		/* 原厂 DTB 的 ram_console / pstore，一字不改地占住 */
+		ram_console_reserved: ram-console@44400000 {
+			reg = <0 0x44400000 0 0x10000>;
+			no-map;
+		};
+		/*
+		 * ramoops 必须是 reserved-memory 的直接子节点（不是并列节点）。
+		 * 放在原厂 pstore 区 0x44410000；内核跑到 pstore 初始化之后，
+		 * console 会留在这块内存里，重启回 Android 后仍可能从
+		 * /sys/fs/pstore 读到（MTK 的 persistent_ram 与它同源）。
+		 */
+		ramoops: ramoops@44410000 {
+			compatible = "ramoops";
+			reg = <0 0x44410000 0 0xe0000>;
+			record-size = <0x10000>;
+			console-size = <0x80000>;
+			pmsg-size = <0x10000>;
+			ftrace-size = <0>;
+		};
+		atf@44600000 {
+			reg = <0 0x44600000 0 0x10000>;
+			no-map;
+		};
+		atf-ramdump@44610000 {
+			reg = <0 0x44610000 0 0x30000>;
+			no-map;
+		};
+		preloader@44800000 {
+			reg = <0 0x44800000 0 0x100000>;
+			no-map;
+		};
+		lk@46000000 {
+			reg = <0 0x46000000 0 0x400000>;
+			no-map;
+		};
+		/* 保护 LK 留下的整块 vram，否则会被 buddy 分配掉导致花屏。
+		 * 大小 0x1be0000 = atag,videolfb 里的 vramSize。 */
+		fb_reserved: framebuffer@b9be0000 {
+			reg = <0 0xb9be0000 0 0x1be0000>;
+			no-map;
+		};
+	};
+
+	/* LK 已经把 USB 3.3V 打开了，这里只是一个 always-on 的占位 */
+	lk_vusb: regulator-vusb {
+		compatible = "regulator-fixed";
+		regulator-name = "lk-retained-vusb33";
+		regulator-min-microvolt = <3300000>;
+		regulator-max-microvolt = <3300000>;
+		regulator-always-on;
+		regulator-boot-on;
+	};
+
+	/*
+	 * 这个节点同时是 clock provider（3 个 gate）和 phy provider。
+	 * 驱动：drivers/phy/mediatek/phy-mt6797-lk-usb.c
+	 *   index 0 = bus, 1 = sys, 2 = ref
+	 * 它只开 infracfg 里对应的 gate，不重配 PLL —— 这是关键。
+	 */
+	usb_resources: usb-resources@11290000 {
+		compatible = "mediatek,mt6797-lk-usb-resources",
+			     "leeco,x620-lk-usb-resources";
+		reg = <0 0x11290000 0 0x1000>, <0 0x10001000 0 0x1000>;
+		reg-names = "phy", "infracfg";
+		#phy-cells = <0>;
+		#clock-cells = <1>;
+	};
+
+	usb0: usb@11271000 {
+		compatible = "mediatek,mt6797-mtu3", "mediatek,mtu3";
+		/* mac 在 0x11271000；ippc 在 ssusb+0x10700 */
+		reg = <0 0x11271000 0 0x3000>, <0 0x11280700 0 0x100>;
+		reg-names = "mac", "ippc";
+		interrupts = <GIC_SPI 127 IRQ_TYPE_LEVEL_LOW>;
+		interrupt-names = "device";
+		clocks = <&usb_resources 1>, <&usb_resources 2>,
+			 <&usb_resources 0>, <&usb_resources 0>;
+		clock-names = "sys_ck", "ref_ck", "mcu_ck", "dma_ck";
+		phys = <&usb_resources>;
+		vusb33-supply = <&lk_vusb>;
+		dr_mode = "peripheral";
+		maximum-speed = "high-speed";
+		mediatek,u3p-dis-msk = <1>;
+		mediatek,force-vbus;
+	};
+
+	/*
+	 * infra_clocks（mediatek,mt6797-infracfg-retained）在 v2 里被删掉了：
+	 * 它依赖 &infrasys 的 syscon regmap，而 &infrasys 现在 disabled；
+	 * 并且 UART0 也已经禁用，没有任何消费者了。
+	 * USB 的时钟由 usb_resources（phy-mt6797-lk-usb）自己 ioremap 0x10001000 提供。
+	 */
+};
+
+/*
+ * ============================================================
+ *  retain-bootloader-state：这一节是 v2 挂死后的关键修正
+ * ============================================================
+ * v1/v2 都从 mt6797.dtsi 继承了 topckgen / infrasys / apmixedsys / scpsys
+ * 并且是默认 enabled，于是 clk-mt6797.c 会在 probe 时**重新配置 PLL**。
+ * MX6 的 PLL 表与 X620 不同 —— X620 的 dts 把这四个节点全部
+ * status = "disabled"，就是为了保住 LK 已经配好的时钟树。
+ *
+ * 症状完全吻合：wdt_by_pass_pwk（看门狗复位）、simplefb 之前就没了
+ * （clk 初始化早于 framebuffer），pstore 里一行 mainline 日志都没有。
+ *
+ * 现在：这四个 syscon/clk 全部关掉。USB 的时钟走 phy-mt6797-lk-usb
+ * 自己的 gate（它直接 ioremap 0x10001000，不依赖 &infrasys 节点），
+ * UART 也已经禁用，所以没有任何消费者还需要 &infra_clocks。
+ */
+&topckgen {
+	status = "disabled";
+};
+
+&infrasys {
+	status = "disabled";
+};
+
+&apmixedsys {
+	status = "disabled";
+};
+
+&scpsys {
+	status = "disabled";
+};
+
+/*
+ * pinctrl 也关掉：本版 dts 没有引用任何 pinctrl-0 / gpio，
+ * 让它 probe 只会重新写 GPIO 模式寄存器，多一个挂死点。
+ * USB 的 iddig/drvvbus 引脚保持 LK 配好的状态。
+ */
+&pio {
+	status = "disabled";
+};
+
+/* 显示相关的 syscon 一并关掉：第一版不做 DRM，只要 simplefb */
+&mmsys {
+	status = "disabled";
+};
+
+&imgsys {
+	status = "disabled";
+};
+
+&vdecsys {
+	status = "disabled";
+};
+
+&vencsys {
+	status = "disabled";
+};
