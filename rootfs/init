@@ -1,0 +1,157 @@
+#!/bin/busybox sh
+# ============================================================================
+#  Meizu MX6 / MT6797 -- mainline 6.12 init
+#  唯一目标：把内核日志从现在开始，全部实时吐到 USB CDC-ACM 串口上。
+#
+#  与 stock 内核那几版的根本区别
+#  ----------------------------
+#  mainline 内核里**没有** MTK 的 android_usb（/sys/class/android_usb/android0）。
+#  那是厂商私有 gadget 框架。mainline 只有标准 configfs：
+#      /sys/kernel/config/usb_gadget/<name>/
+#  所以这里必须用 configfs 建 gadget、绑 acm function、最后写 UDC。
+#  好在 defconfig 里 CONFIG_USB_CONFIGFS_ACM=y / CONFIG_USB_MTU3_GADGET=y 都是开的。
+#
+#  另一个区别：mainline 打开了 CONFIG_DEVTMPFS + DEVTMPFS_MOUNT，
+#  /dev 是内核自动挂的，/dev/ttyGS0 会在 acm 绑上之后自己出现 —— 不用 mknod。
+#
+#  ⚠️ /init 不能退出（PID 1）。结尾必须有保活循环。
+# ============================================================================
+
+BB=/bin/busybox
+export PATH=/bin:/sbin:/usr/bin:/usr/sbin
+
+G=/sys/kernel/config/usb_gadget/mx6
+
+# ---------------------------------------------------------------- 输出
+# 三个出口都写：kmsg（会被泵到 ttyGS0）、console（硬件 UART，如果有）、tty0
+say() {
+	echo "MX6INIT: $*" > /dev/kmsg    2>/dev/null
+	echo "MX6INIT: $*" > /dev/console 2>/dev/null
+	echo "MX6INIT: $*" > /dev/tty0     2>/dev/null
+	return 0
+}
+
+# ---------------------------------------------------------------- 挂载
+$BB mount -t proc     proc     /proc             2>/dev/null
+$BB mount -t sysfs    sysfs    /sys              2>/dev/null
+$BB mount -t devtmpfs devtmpfs /dev              2>/dev/null
+$BB mount -t configfs none     /sys/kernel/config 2>/dev/null
+$BB mkdir -p /dev/pts /tmp
+$BB mount -t devpts devpts /dev/pts 2>/dev/null
+
+echo "8 4 1 7" > /proc/sys/kernel/printk 2>/dev/null
+
+say "=============================================="
+say "MX6 mainline 6.12 bring-up init (ACM serial)"
+say "=============================================="
+say "uname  : $($BB uname -a 2>&1)"
+say "cmdline: $($BB cat /proc/cmdline 2>&1)"
+say "devtmpfs mounted: $([ -e /dev/kmsg ] && echo yes || echo no)"
+say "configfs: $([ -d /sys/kernel/config/usb_gadget ] && echo yes || echo NO)"
+say "udc list: $($BB ls /sys/class/udc 2>&1)"
+
+# ------------------------------------------------------ 等 USB 控制器出现
+# mtu3 是 platform driver，probe 完才有 /sys/class/udc/<name>
+K=0
+UDC=""
+while [ $K -lt 30 ]; do
+	K=$((K + 1))
+	UDC=$($BB ls /sys/class/udc 2>/dev/null | $BB head -1)
+	[ -n "$UDC" ] && break
+	$BB sleep 1
+done
+say "STEP1 udc=[${UDC:-NONE}] waited=${K}s"
+if [ -z "$UDC" ]; then
+	say "!! 没有 UDC —— mtu3 没 probe 成功，后面 configfs 绑不上"
+	say "   继续往下走，把能试的都试一遍"
+fi
+
+# ---------------------------------------------------------- 建 gadget
+say "--- configfs gadget ---"
+$BB mkdir -p "$G"          2>/dev/null; say "  mkdir gadget      rc=$?"
+echo 0x2A45 > "$G/idVendor"  2>/dev/null
+echo 0x0F01 > "$G/idProduct" 2>/dev/null
+echo 0x0200 > "$G/bcdUSB"    2>/dev/null
+echo 0x0100 > "$G/bcdDevice" 2>/dev/null
+
+$BB mkdir -p "$G/strings/0x409" 2>/dev/null
+echo "MX6ACM0001" > "$G/strings/0x409/serialnumber" 2>/dev/null
+echo "Meizu"      > "$G/strings/0x409/manufacturer" 2>/dev/null
+echo "MX6 ACM"    > "$G/strings/0x409/product"      2>/dev/null
+
+$BB mkdir -p "$G/configs/c.1/strings/0x409" 2>/dev/null
+echo "ACM" > "$G/configs/c.1/strings/0x409/configuration" 2>/dev/null
+echo 500   > "$G/configs/c.1/MaxPower" 2>/dev/null
+
+# acm.gs0 —— 名字里的 gs0 就是 u_serial 的端口号
+$BB mkdir -p "$G/functions/acm.gs0" 2>/dev/null; say "  mkdir acm.gs0     rc=$?"
+say "  functions: $($BB ls "$G/functions" 2>&1 | $BB tr '\n' ' ')"
+
+# 链接 function 到配置（configfs 的 ln -s 是创建关联）
+if [ -d "$G/functions/acm.gs0" ]; then
+	ln -sf "$G/functions/acm.gs0" "$G/configs/c.1/" 2>/dev/null
+	say "  symlink           rc=$?  c.1=[$($BB ls "$G/configs/c.1" 2>&1 | $BB tr '\n' ' ')]"
+fi
+
+# 绑定 UDC —— 这一步之后主机才会看到设备
+if [ -n "$UDC" ]; then
+	echo "$UDC" > "$G/UDC" 2>/dev/null
+	say "  echo $UDC > UDC  rc=$?  readback=[$($BB cat "$G/UDC" 2>&1)]"
+else
+	say "  !! 跳过 UDC 绑定（没有 UDC）"
+fi
+
+# ------------------------------------------------- 等 ttyGS0 并挂日志泵
+K=0
+GS=""
+while [ $K -lt 20 ]; do
+	K=$((K + 1))
+	[ -c /dev/ttyGS0 ] && { GS=/dev/ttyGS0; break; }
+	$BB sleep 1
+done
+say "STEP2 ttyGS0=[${GS:-MISSING}] waited=${K}s"
+say "  /sys/class/tty: $($BB ls /sys/class/tty 2>/dev/null | $BB tr '\n' ' ')"
+
+if [ -n "$GS" ]; then
+	# 先把 ring buffer 整段倒出来，再实时跟 kmsg。
+	# 主机没打开串口时 open() 会阻塞，只阻塞这个后台子进程，不影响 init。
+	(
+		echo ""
+		echo "########## MX6 KERNEL LOG (dmesg ring buffer) ##########"
+		$BB dmesg 2>&1
+		echo ""
+		echo "########## live /dev/kmsg ##########"
+		$BB cat /dev/kmsg 2>/dev/null
+	) > "$GS" 2>&1 &
+	PUMP=$!
+	say "  log pump pid=$PUMP -> $GS"
+else
+	PUMP=""
+	say "!! ttyGS0 没出现 —— acm function 没绑上，检查 dmesg 里 mtu3 的报错"
+fi
+
+# ---------------------------------------------------------------- 保活
+say "--- keepalive 600s ---"
+N=0
+while [ $N -lt 600 ]; do
+	N=$((N + 1))
+	if [ $((N % 20)) -eq 0 ]; then
+		say "alive ${N}s udc=[$($BB cat "$G/UDC" 2>/dev/null)] ttyGS0=$([ -c /dev/ttyGS0 ] && echo yes || echo no) pump=$([ -n "$PUMP" ] && echo $PUMP || echo none)"
+	fi
+	# 泵挂了就重启（比如主机断开重连）
+	if [ -n "$PUMP" ] && ! $BB kill -0 "$PUMP" 2>/dev/null && [ -c /dev/ttyGS0 ]; then
+		say "!! pump died, restart"
+		( $BB dmesg 2>&1; $BB cat /dev/kmsg 2>/dev/null ) > /dev/ttyGS0 2>&1 &
+		PUMP=$!
+	fi
+	$BB sleep 1
+done
+
+say "=== init done -> reboot -f ==="
+$BB sync
+$BB sleep 1
+$BB reboot -f 2>/dev/null
+
+# 万一 reboot 失败也别退出
+echo b > /proc/sysrq-trigger 2>/dev/null
+while true; do $BB sleep 3600; done
