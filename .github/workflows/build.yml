@@ -1,13 +1,12 @@
 name: build-mx6-kernel
 
 on:
+  # 只保留手动触发：避免每推一个文件就触发一次构建（会产生一堆失败邮件）
   workflow_dispatch:
-  push:
-    paths:
-      - 'board/**'
-      - 'config/**'
-      - 'rootfs/**'
-      - '.github/workflows/**'
+
+concurrency:
+  group: build-mx6
+  cancel-in-progress: true
 
 jobs:
   build:
