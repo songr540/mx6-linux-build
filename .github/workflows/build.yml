@@ -52,13 +52,33 @@ jobs:
             printf '%-34s %s\n' "$k" "$(grep -E "^$k=|^# $k is not set" .config | head -1)"
           done
 
-      - name: Build Image.gz + dtbs
+      - name: Build Image.gz
         run: |
           K="$RUNNER_TEMP/linux"
           cd "$K"
-          make -j"$(nproc)" ARCH=arm64 Image.gz dtbs 2>&1 | tail -40
-          echo "===== artifacts ====="
+          echo "=== env ==="
+          nproc; free -m | head -2; df -h . | tail -1; gcc --version | head -1
+          echo "=== build ==="
+          if ! make -j"$(nproc)" ARCH=arm64 Image.gz > build.log 2>&1 ; then
+            echo "########## BUILD FAILED ##########"
+            grep -nE "error:|Error [0-9]|undefined|No such file|No space|Killed|fatal" build.log | tail -30
+            echo "---------- last 40 ----------"
+            tail -40 build.log
+            exit 1
+          fi
+          tail -5 build.log
           ls -l arch/arm64/boot/Image.gz
+
+      - name: Build dtbs
+        run: |
+          K="$RUNNER_TEMP/linux"
+          cd "$K"
+          if ! make ARCH=arm64 dtbs > dtbs.log 2>&1 ; then
+            echo "########## DTBS FAILED ##########"
+            tail -40 dtbs.log
+            exit 1
+          fi
+          ls -l arch/arm64/boot/dts/mediatek/*.dtb | tail -5
 
       - name: Collect
         run: |
