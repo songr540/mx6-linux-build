@@ -12,7 +12,7 @@ jobs:
   build:
     # 公开仓库免费的原生 arm64 4vCPU/16GB runner
     runs-on: ubuntu-24.04-arm
-    timeout-minutes: 180
+    timeout-minutes: 240
 
     steps:
       - name: Checkout
@@ -24,7 +24,7 @@ jobs:
           sudo apt-get install -y -qq bc bison flex libssl-dev libelf-dev \
                                      device-tree-compiler rsync cpio kmod ccache
           echo "CCACHE_DIR=$HOME/.ccache" >> $GITHUB_ENV
-          echo "CCACHE_MAXSIZE=2G"     >> $GITHUB_ENV
+          echo "CCACHE_MAXSIZE=3G"     >> $GITHUB_ENV
           echo "PATH=/usr/lib/ccache:$PATH" >> $GITHUB_ENV
           ccache --version | head -1
 
@@ -32,10 +32,9 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.ccache
-          key: ccache-${{ hashFiles('config/min.config','config/apply.sh','board/**') }}-${{ github.run_id }}
+          key: ccache-x620-${{ github.run_id }}
           restore-keys: |
-            ccache-${{ hashFiles('config/min.config','config/apply.sh','board/**') }}-
-            ccache-
+            ccache-x620-
 
       - name: Fetch mt6797-mainline kernel
         run: |
@@ -43,29 +42,30 @@ jobs:
           cd "$RUNNER_TEMP/linux"
           git log -1 --format='KERNEL_HEAD %H %ad %s' --date=short
 
-      - name: Apply board files
+      - name: Apply board files (X620 base)
         run: |
           K="$RUNNER_TEMP/linux"
           gunzip -c rootfs/bin/busybox.gz > rootfs/bin/busybox
           chmod +x rootfs/init rootfs/bin/busybox
-          cp board/mt6797-meizu-mx6.dts "$K/arch/arm64/boot/dts/mediatek/"
-          cp board/mt6797-meizu-mx6-stockbase.dts "$K/arch/arm64/boot/dts/mediatek/" 2>/dev/null || true
+
+          # 照抄 mt6797-mainline 的板级 dts，仅把 simplefb 基址换成本机实测值
+          cp board/mt6797-leeco-x620-mx6.dts "$K/arch/arm64/boot/dts/mediatek/"
           MK="$K/arch/arm64/boot/dts/mediatek/Makefile"
-          for d in mt6797-meizu-mx6 mt6797-meizu-mx6-stockbase; do
-            if [ -f "$K/arch/arm64/boot/dts/mediatek/$d.dts" ] && ! grep -q "$d" "$MK"; then
-              echo "dtb-\$(CONFIG_ARCH_MEDIATEK) += $d.dtb" >> "$MK"
-            fi
-          done
-          cp config/min.config "$K/.config"
-          sh config/apply.sh "$K"
+          grep -q "mt6797-leeco-x620-mx6" "$MK" || \
+            echo 'dtb-$(CONFIG_ARCH_MEDIATEK) += mt6797-leeco-x620-mx6.dtb' >> "$MK"
+
+          # 照抄它自带的 defconfig
+          cp "$K/arch/arm64/configs/mt6797_x620.config" "$K/.config"
+          sh config/apply-x620.sh "$K"
           cd "$K"
           scripts/config --file .config --set-str INITRAMFS_SOURCE "$GITHUB_WORKSPACE/rootfs"
           make ARCH=arm64 olddefconfig >/dev/null
           echo '===== effective config ====='
           for k in CONFIG_CMDLINE CONFIG_INITRAMFS_SOURCE CONFIG_DEBUG_INFO_BTF \
-                   CONFIG_USB_MUSB_HDRC CONFIG_USB_MUSB_GADGET CONFIG_USB_MUSB_MEDIATEK \
-                   CONFIG_USB_MTU3 CONFIG_FB_SIMPLE CONFIG_FRAMEBUFFER_CONSOLE CONFIG_PSTORE_RAM; do
-            printf '%-34s %s\n' "$k" "$(grep -E "^$k=|^# $k is not set" .config | head -1)"
+                   CONFIG_USB_MTU3 CONFIG_USB_CONFIGFS CONFIG_USB_CONFIGFS_ACM \
+                   CONFIG_PHY_MT6797_LK_USB CONFIG_COMMON_CLK_MT6797_LK_INFRA \
+                   CONFIG_FB_SIMPLE CONFIG_FRAMEBUFFER_CONSOLE CONFIG_PSTORE_RAM; do
+            printf '%-38s %s\n' "$k" "$(grep -E "^$k=|^# $k is not set" .config | head -1)"
           done
 
       - name: Build Image.gz
@@ -96,21 +96,20 @@ jobs:
             tail -40 dtbs.log
             exit 1
           fi
-          ls -l arch/arm64/boot/dts/mediatek/*.dtb | tail -5
+          ls -l arch/arm64/boot/dts/mediatek/*x620-mx6*.dtb
 
       - name: Collect
         run: |
           K="$RUNNER_TEMP/linux"
           mkdir -p out
           cp "$K/arch/arm64/boot/Image.gz" out/
-          cp "$K/arch/arm64/boot/dts/mediatek/mt6797-meizu-mx6.dtb" out/ 2>/dev/null || true
-          cp "$K/arch/arm64/boot/dts/mediatek/mt6797-meizu-mx6-stockbase.dtb" out/ 2>/dev/null || true
+          cp "$K/arch/arm64/boot/dts/mediatek/mt6797-leeco-x620-mx6.dtb" out/ 2>/dev/null || true
           cp "$K/.config" out/config-built.txt
           ls -l out/
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: mx6-6x-kernel
+          name: mx6-6x-x620base
           path: out/
           retention-days: 30
