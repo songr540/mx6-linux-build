@@ -56,7 +56,7 @@ jobs:
 
           # 照抄它自带的 defconfig
           cp "$K/arch/arm64/configs/mt6797_x620.config" "$K/.config"
-          sh config/apply-x620.sh "$K"
+          sh config/apply-small.sh "$K"
           cd "$K"
           scripts/config --file .config --set-str INITRAMFS_SOURCE "$GITHUB_WORKSPACE/rootfs"
           make ARCH=arm64 olddefconfig >/dev/null
@@ -107,9 +107,17 @@ jobs:
           cp "$K/.config" out/config-built.txt
           ls -l out/
 
+      - name: Publish release asset (fast download in CN)
+        if: success()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release delete latest --yes --cleanup-tag 2>/dev/null || true
+          gh release create latest out/* --title "auto build" --notes "commit ${{ github.sha }}"
+
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: mx6-6x-x620base
+          name: mx6-6x-small
           path: out/
           retention-days: 30
